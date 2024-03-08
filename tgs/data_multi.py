@@ -378,6 +378,7 @@ class MultiImageOrbitDataset(Dataset):
         }
         out["c2w"][..., :3, 1:3] *= -1
         out["c2w_cond"][..., :3, 1:3] *= -1
+        out["poses_cond"][..., :3, 1:3] *= -1
         instance_id = os.path.split(img_paths[0])[-1].split('.')[0]
         out["index"] = torch.as_tensor(scene_index)
         out["background_color"] = self.background_color
