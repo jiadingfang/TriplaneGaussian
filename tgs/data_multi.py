@@ -171,29 +171,24 @@ class MultiImageOrbitDataset(Dataset):
             cond_c2w[3, 3] = 1.0
             self.c2w_cond = cond_c2w
 
-        view_poses = {}
-        for view in self.cfg.input_view_list:
-            view_poses[view] = torch.from_numpy(np.array(self.cameras[view]))
-
-        # print('view poses:', view_poses.values())
-        # print('view poses shape:', (list(view_poses.values())[0].shape))
-        # G_w_cc = torch.stack(list((view_poses.values())), dim=0)
-        G_w_cc = np.array([view_poses[self.cfg.input_view_list[0]]])
-        # print('G_w_cc:', G_w_cc)
-        # print('G_w_cc.shape:', G_w_cc.shape)
+        G_w_cc = np.array([self.cameras[self.cfg.input_view_list[0]]], dtype=np.float32)
         G_cc_w = np.linalg.inv(G_w_cc)
-        # cc_dists = np.linalg.norm(cc_i2ws[..., :3, 3], axis=-1, keepdims=True)
+
         # assuming the object is at the origin of the world coordinate frame
         d_w = (-G_w_cc @ complete_pts(np.zeros(3)))[:, [2]]
         S_tgs_w = complete_trans(d_w / self.cfg.cond_camera_distance * np.identity(3))
         self.S_tgs_w = torch.from_numpy(S_tgs_w).float()
-        # cc_i2ws[:, :3, 3] *= self.cfg.cond_camera_distance / cc_dists
 
         T_tgs_w = torch.tensor(G_cc_w @ S_tgs_w, dtype=torch.float32) @ torch.linalg.inv(self.c2w_cond)
-        T_w_tgs = torch.linalg.inv(T_tgs_w)
+        T_w_tgs = torch.linalg.inv(T_tgs_w).float()
         self.T_w_tgs = T_w_tgs.float()
-        
-        # evaluation
+
+        # assert check
+        # print('self.c2w_cond: ', self.c2w_cond)
+        # print('self.T_w_tgs @ G_cc_w @ self.S_tgs_w: ', self.T_w_tgs @ G_cc_w @ self.S_tgs_w)
+        assert torch.allclose(self.T_w_tgs @ G_cc_w @ self.S_tgs_w, self.c2w_cond, atol=1e-5)
+
+        # evaluation setup
         n = (1 + np.sqrt(1 + self.n_views * (self.cfg.eval_elevation_deg_hi - self.cfg.eval_elevation_deg_lo) / 90)) / 2
         m = round(self.n_views / n)
         n = round(n)
@@ -345,7 +340,9 @@ class MultiImageOrbitDataset(Dataset):
 
             img_index = os.path.split(img_path)[-1].split('.')[0]
 
-            G_cc_w = torch.from_numpy(np.array(self.cameras[img_index])).float()
+            G_w_cc = np.array(self.cameras[img_index], dtype=np.float32)
+            G_cc_w = np.linalg.inv(G_w_cc)
+            G_cc_w = torch.from_numpy(G_cc_w).float()
             G_cc_tgs = self.T_w_tgs @ G_cc_w @ self.S_tgs_w
 
             return rgb_cond, mask_cond, G_cc_tgs
@@ -358,6 +355,9 @@ class MultiImageOrbitDataset(Dataset):
 
         rgb_cond = rgbs_cond[0]
         mask_cond = masks_cond[0]
+
+        # print('self.c2w_cond:', self.c2w_cond)
+        # print('poses_cond:', poses_cond)
 
         out = {
             "rgb_cond": rgb_cond.unsqueeze(0),
@@ -411,4 +411,7 @@ if __name__ == "__main__":
     print('sample_data["poses_cond"].shape:', sample_data["poses_cond"].shape)
     print('sample_data["intrinsic_cond"].shape:', sample_data["intrinsic_cond"].shape)
     print('sample_data["intrinsic_normed_cond"].shape:', sample_data["intrinsic_normed_cond"].shape)
-    
+
+    print('sample_data["c2w_cond"]:', sample_data["c2w_cond"])
+    print('sample_data["poses_cond"]:', sample_data["poses_cond"])
+
