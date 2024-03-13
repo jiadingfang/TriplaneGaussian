@@ -98,12 +98,11 @@ class MultiImageDataModuleConfig:
     eval_height: int = 512
     eval_width: int = 512
     eval_batch_size: int = 1
-    eval_elevation_deg_lo: float = -30.0
-    eval_elevation_deg_hi: float = 60.0
+    eval_elevation_deg: float = 0.0
     eval_camera_distance: float = 1.6
     eval_fovy_deg: float = 40.0
-    n_test_views: int = 168
-    num_views_output: int = 168
+    n_test_views: int = 120
+    num_views_output: int = 120
     only_3dgs: bool = False
 
 
@@ -119,9 +118,13 @@ class MultiImageOrbitDataset(Dataset):
 
         self.n_imgs = len(self.cfg.input_view_list)
         # self.all_scenes = _parse_scene_list(self.cfg.image_list)
+        print('self.cfg.multi_view_dir:', self.cfg.multi_view_dir)
+        print('self.cfg.split:', self.cfg.split)
+        print('self.cfg.input_view_list:', self.cfg.input_view_list)
         self.all_scenes = _parse_single_multi_view_scene(self.cfg.multi_view_dir, self.cfg.split, self.cfg.input_view_list)
         # print('self.all_scenes:', self.all_scenes)
         # get image width and height
+        print('self.all_scenes: ', self.all_scenes)
         img = Image.open(self.all_scenes[0][0])
         self.img_width, self.img_height = img.size
 
@@ -129,12 +132,22 @@ class MultiImageOrbitDataset(Dataset):
         self.cameras_path = Path(self.cfg.multi_view_dir) / "camera_{}.json".format(self.cfg.split)
         # load intrinsic from camera json
         self.cameras = json.load(open(self.cameras_path))
-        self.intrinsic_cond = torch.from_numpy(np.array(self.cameras['K']))
+        # self.intrinsic_cond = torch.from_numpy(np.array(self.cameras['K'], dtype=np.float32))
+        # self.intrinsic_normed_cond = self.intrinsic_cond.clone()
+        # self.intrinsic_normed_cond[..., 0, 2] /= self.img_width
+        # self.intrinsic_normed_cond[..., 1, 2] /= self.img_height
+        # self.intrinsic_normed_cond[..., 0, 0] /= self.img_width
+        # self.intrinsic_normed_cond[..., 1, 1] /= self.img_height
+        self.intrinsic_cond = get_intrinsic_from_fov(
+            np.deg2rad(self.cfg.cond_fovy_deg),
+            H=self.cfg.cond_height,
+            W=self.cfg.cond_width,
+        )
         self.intrinsic_normed_cond = self.intrinsic_cond.clone()
-        self.intrinsic_normed_cond[..., 0, 2] /= self.img_width
-        self.intrinsic_normed_cond[..., 1, 2] /= self.img_height
-        self.intrinsic_normed_cond[..., 0, 0] /= self.img_width
-        self.intrinsic_normed_cond[..., 1, 1] /= self.img_height
+        self.intrinsic_normed_cond[..., 0, 2] /= self.cfg.cond_width
+        self.intrinsic_normed_cond[..., 1, 2] /= self.cfg.cond_height
+        self.intrinsic_normed_cond[..., 0, 0] /= self.cfg.cond_width
+        self.intrinsic_normed_cond[..., 1, 1] /= self.cfg.cond_height
 
         if self.cfg.relative_pose:
             self.c2w_cond = torch.as_tensor(
@@ -189,59 +202,57 @@ class MultiImageOrbitDataset(Dataset):
         assert torch.allclose(self.T_w_tgs @ G_cc_w @ self.S_tgs_w, self.c2w_cond, atol=1e-5)
 
         # evaluation setup
-        n = (1 + np.sqrt(1 + self.n_views * (self.cfg.eval_elevation_deg_hi - self.cfg.eval_elevation_deg_lo) / 90)) / 2
-        m = round(self.n_views / n)
-        n = round(n)
-        # self.cfg.num_views_output is no longer respected, as self.n_views may not be dividable
-        self.n_views = self.cfg.num_views_output = m * n
-        azimuth_deg: Float[Tensor, "B"] = torch.linspace(0, 360.0, m + 1)[:m]
-        elevation_deg = torch.linspace(self.cfg.eval_elevation_deg_lo, self.cfg.eval_elevation_deg_hi, n)
-        elevation_deg, azimuth_deg = torch.meshgrid(elevation_deg, azimuth_deg, indexing='ij')
-        azimuth_deg = azimuth_deg.reshape(-1)
-        elevation_deg = elevation_deg.reshape(-1)
+        self.n_views = self.cfg.n_test_views
+        assert self.n_views % self.cfg.num_views_output == 0
+
+        azimuth_deg: Float[Tensor, "B"] = torch.linspace(0, 360.0, self.n_views + 1)[
+            : self.n_views
+        ]
+        elevation_deg: Float[Tensor, "B"] = torch.full_like(
+            azimuth_deg, self.cfg.eval_elevation_deg
+        )
+        camera_distances: Float[Tensor, "B"] = torch.full_like(
+            elevation_deg, self.cfg.eval_camera_distance
+        )
 
         elevation = elevation_deg * math.pi / 180
         azimuth = azimuth_deg * math.pi / 180
 
-        camera_positions_norm: Float[Tensor, "B 3"] = torch.stack(
+        # convert spherical coordinates to cartesian coordinates
+        # right hand coordinate system, x back, y right, z up
+        # elevation in (-90, 90), azimuth from +x to +y in (-180, 180)
+        camera_positions: Float[Tensor, "B 3"] = torch.stack(
             [
-                torch.cos(elevation) * torch.cos(azimuth),
-                torch.cos(elevation) * torch.sin(azimuth),
-                torch.sin(elevation),
+                camera_distances * torch.cos(elevation) * torch.cos(azimuth),
+                camera_distances * torch.cos(elevation) * torch.sin(azimuth),
+                camera_distances * torch.sin(elevation),
             ],
             dim=-1,
         )
-        
-        eval_cam_dist = d_w.mean()
-        camera_positions = T_w_tgs[:, None, ...] @ complete_pts(camera_positions_norm * eval_cam_dist)
-        # camera_positions = self.c2w_cond @ torch.linalg.inv(cc2ws)[:, None, ...].float() @ complete_pts(camera_positions_norm * self.cfg.eval_camera_distance)
-        camera_positions = camera_positions[..., :3, 0]
 
         # default scene center at origin
-        center: Float[Tensor, "M B 3"] = torch.zeros_like(camera_positions)
+        center: Float[Tensor, "B 3"] = torch.zeros_like(camera_positions)
         # default camera up direction as +z
-        # up: Float[Tensor, "M B 3"] = torch.as_tensor([0, 0, 1], dtype=torch.float32)[
-        #     None, :
-        # ].repeat(self.n_imgs, self.n_views, 1)
-        up = T_w_tgs @ complete_pts(torch.tensor([0, 0, 1], dtype=torch.float32))
-        up = up[:, None, :3, 0].expand(-1, self.n_views, -1)
+        up: Float[Tensor, "B 3"] = torch.as_tensor([0, 0, 1], dtype=torch.float32)[
+            None, :
+        ].repeat(self.n_views, 1)
 
         fovy_deg: Float[Tensor, "B"] = torch.full_like(
             elevation_deg, self.cfg.eval_fovy_deg
         )
         fovy = fovy_deg * math.pi / 180
 
-        lookat: Float[Tensor, "M B 3"] = F.normalize(center - camera_positions, dim=-1)
-        right: Float[Tensor, "M B 3"] = F.normalize(torch.cross(lookat, up), dim=-1)
+        lookat: Float[Tensor, "B 3"] = F.normalize(center - camera_positions, dim=-1)
+        right: Float[Tensor, "B 3"] = F.normalize(torch.cross(lookat, up), dim=-1)
         up = F.normalize(torch.cross(right, lookat), dim=-1)
-        c2w3x4: Float[Tensor, "M B 3 4"] = torch.cat(
-            [torch.stack([right, up, -lookat], dim=-1), camera_positions[..., None]],
+        c2w3x4: Float[Tensor, "B 3 4"] = torch.cat(
+            [torch.stack([right, up, -lookat], dim=-1), camera_positions[:, :, None]],
             dim=-1,
         )
-        c2w: Float[Tensor, "M B 4 4"] = torch.cat(
-            [c2w3x4, torch.zeros_like(c2w3x4[..., [0], :])], dim=-2
+        c2w: Float[Tensor, "B 4 4"] = torch.cat(
+            [c2w3x4, torch.zeros_like(c2w3x4[:, :1])], dim=1
         )
-        c2w[..., 3, 3] = 1.0
+        c2w[:, 3, 3] = 1.0
 
         # get directions by dividing directions_unit_focal by focal length
         focal_length: Float[Tensor, "B"] = (
@@ -259,15 +270,7 @@ class MultiImageOrbitDataset(Dataset):
             directions[:, :, :, :2] / focal_length[:, None, None, None]
         )
         # must use normalize=True to normalize directions here
-        rays_o = []
-        rays_d = []
-        for cw2_ in c2w:
-            rays_o_, rays_d_ = get_rays(directions, cw2_, keepdim=True)
-            rays_o.append(rays_o_)
-            rays_d.append(rays_d_)
-        rays_o = np.array(rays_o)
-        rays_d = np.array(rays_d)
-        # rays_o, rays_d = get_rays(directions, c2w, keepdim=True)
+        rays_o, rays_d = get_rays(directions, c2w, keepdim=True)
 
         intrinsic: Float[Tensor, "B 3 3"] = get_intrinsic_from_fov(
             self.cfg.eval_fovy_deg * math.pi / 180,
@@ -288,25 +291,6 @@ class MultiImageOrbitDataset(Dataset):
         self.camera_positions = camera_positions
 
         self.background_color = torch.as_tensor(self.cfg.background_color)
-
-        # camera_positions_abs = camera_positions_norm * eval_cam_dist
-        # center_abs: Float[Tensor, "B 3"] = torch.zeros_like(camera_positions_abs)
-        # # default camera up direction as +z
-        # up_abs: Float[Tensor, "B 3"] = torch.as_tensor([0, 0, 1], dtype=torch.float32)[
-        #     None, :
-        # ].repeat(self.n_views, 1)
-
-        # lookat_abs: Float[Tensor, "B 3"] = F.normalize(center_abs - camera_positions_abs, dim=-1)
-        # right_abs: Float[Tensor, "B 3"] = F.normalize(torch.cross(lookat_abs, up_abs), dim=-1)
-        # up_abs = F.normalize(torch.cross(right_abs, lookat_abs), dim=-1)
-        # c2w3x4_abs: Float[Tensor, "B 3 4"] = torch.cat(
-        #     [torch.stack([right_abs, up_abs, -lookat_abs], dim=-1), camera_positions_abs[..., None]],
-        #     dim=-1,
-        # )
-        # c2w_abs: Float[Tensor, "B 4 4"] = torch.cat(
-        #     [c2w3x4_abs, torch.zeros_like(c2w3x4_abs[..., [0], :])], dim=-2
-        # )
-        # c2w_abs[..., 3, 3] = 1.0
 
     def __len__(self):
         if self.cfg.only_3dgs:
@@ -359,6 +343,15 @@ class MultiImageOrbitDataset(Dataset):
         # print('self.c2w_cond:', self.c2w_cond)
         # print('poses_cond:', poses_cond)
 
+        # print('view_index:', view_index)
+        # print('self.rays_o.shape:', self.rays_o.shape)
+        # print('self.rays_d.shape:', self.rays_d.shape)
+        # print('self.intrinsic.shape:', self.intrinsic.shape)
+        # print('self.intrinsic_normed.shape:', self.intrinsic_normed.shape)
+        # print('self.c2w.shape:', self.c2w.shape)
+        # print('self.camera_positions.shape:', self.camera_positions.shape)
+
+
         out = {
             "rgb_cond": rgb_cond.unsqueeze(0),
             "c2w_cond": self.c2w_cond.unsqueeze(0),
@@ -369,12 +362,12 @@ class MultiImageOrbitDataset(Dataset):
             "intrinsic_cond": self.intrinsic_cond.unsqueeze(0),
             "intrinsic_normed_cond": self.intrinsic_normed_cond.unsqueeze(0),
             "view_index": torch.as_tensor(view_index),
-            "rays_o": self.rays_o[scene_index][view_index],
-            "rays_d": self.rays_d[scene_index][view_index],
+            "rays_o": self.rays_o[view_index],
+            "rays_d": self.rays_d[view_index],
             "intrinsic": self.intrinsic[view_index],
             "intrinsic_normed": self.intrinsic_normed[view_index],
-            "c2w": self.c2w[scene_index][view_index],
-            "camera_positions": self.camera_positions[scene_index][view_index],
+            "c2w": self.c2w[view_index],
+            "camera_positions": self.camera_positions[view_index],
         }
         out["c2w"][..., :3, 1:3] *= -1
         out["c2w_cond"][..., :3, 1:3] *= -1
@@ -395,7 +388,8 @@ if __name__ == "__main__":
     cfg = {
         "multi_view_dir": "/datasets/paris/load/sapien/USB/100109/start",
         "split": "train",
-        "input_view_list": ['0000', '0001', '0003'],
+        # "input_view_list": ['0000', '0001', '0003'],
+        "input_view_list": ['0000'],
     }
 
     # MultiImageDataModuleConfig(**cfg)
@@ -413,6 +407,27 @@ if __name__ == "__main__":
     print('sample_data["intrinsic_cond"].shape:', sample_data["intrinsic_cond"].shape)
     print('sample_data["intrinsic_normed_cond"].shape:', sample_data["intrinsic_normed_cond"].shape)
 
-    print('sample_data["c2w_cond"]:', sample_data["c2w_cond"])
+    # print('sample_data["c2w_cond"]:', sample_data["c2w_cond"])
     print('sample_data["poses_cond"]:', sample_data["poses_cond"])
+
+    # print('sample_data["rgb_cond"]:', sample_data["rgb_cond"])
+    # print('sample_data["c2w_cond"]:', sample_data["c2w_cond"])
+    # print('sample_data["mask_cond"]:', sample_data["mask_cond"])
+    print('sample_data["intrinsic_cond"]:', sample_data["intrinsic_cond"])
+    print('sample_data["intrinsic_normed_cond"]:', sample_data["intrinsic_normed_cond"])
+
+    # print('sample_data["view_index"]:', sample_data["view_index"])
+    # print('sample_data["rays_o"].shape:', sample_data["rays_o"].shape)
+    # print('sample_data["rays_d"].shape:', sample_data["rays_d"].shape)
+    # print('sample_data["intrinsic"].shape:', sample_data["intrinsic"].shape)
+    # print('sample_data["intrinsic_normed"].shape:', sample_data["intrinsic_normed"].shape)
+    # print('sample_data["c2w"].shape:', sample_data["c2w"].shape)
+    # print('sample_data["camera_positions"].shape:', sample_data["camera_positions"].shape)
+
+    # print('sample_data["rays_o"]:', sample_data["rays_o"])
+    # print('sample_data["rays_d"]:', sample_data["rays_d"])
+    # print('sample_data["intrinsic"]:', sample_data["intrinsic"])
+    # print('sample_data["intrinsic_normed"]:', sample_data["intrinsic_normed"])
+    # print('sample_data["c2w"]:', sample_data["c2w"])
+    # print('sample_data["camera_positions"]:', sample_data["camera_positions"])
 
